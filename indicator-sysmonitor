@@ -1,0 +1,598 @@
+#!/usr/bin/python
+# coding: utf-8
+#
+# A simple indicator applet displaying cpu and memory information
+#
+# Author: Alex Eftimie <alex@eftimie.ro>
+# Homepage: http://launchpad.net/indicator-sysmonitor
+# License: GPL v3
+#
+import sys
+import os
+import shutil
+import json
+import string
+import time
+from copy import deepcopy
+from threading import Thread, Event
+import subprocess
+import psutil as ps
+
+import logging
+logging.basicConfig(file=sys.stderr,level=logging.INFO)
+
+import gobject
+import gtk
+import appindicator
+
+VERSION='0.4.1~unreleased'
+
+gtk.gdk.threads_init()
+
+class StatusFetcher(Thread):
+    def __init__(self, parent):
+        Thread.__init__(self)
+        self.parent = parent
+        self.last = ps.cpu_times()
+
+    def _fetch_cpu(self):
+        last = self.last
+        current = ps.cpu_times()
+
+        total_time_passed = sum([v-last.__dict__[k] if not isinstance(v,list) else 0 for k,v in current.__dict__.iteritems()])
+
+        sys_time = current.system - last.system
+        usr_time = current.user - last.user
+
+        self.last = current
+
+        if total_time_passed > 0:
+            sys_percent = 100 * sys_time / total_time_passed
+            usr_percent = 100 * usr_time / total_time_passed
+            return sys_percent + usr_percent
+        else:
+            return 0
+
+    def _fetch_mem(self):
+        total_mem = subprocess.Popen("free -b | grep Mem | tr -s ' ' | cut -d\  -f 2",
+            stdout=subprocess.PIPE, shell=True).communicate()[0].strip()
+        free_mem = subprocess.Popen("free -b | grep Mem | tr -s ' ' | cut -d\  -f 4-",
+            stdout=subprocess.PIPE, shell=True).communicate()[0].strip()
+        free_mem = sum([int(i) for i in free_mem.split()])
+        return 100 - 100 * float(free_mem) / float(total_mem)
+
+    def _fetch_bat(self, bat_id):
+        current_bat = subprocess.Popen("grep 'remaining capacity:' /proc/acpi/battery/BAT%s/state |awk '{print $3}' |grep [0-9] || echo 10" % bat_id,
+            stdout=subprocess.PIPE, shell=True).communicate()[0].strip()
+        #total_bat = subprocess.Popen("cat /proc/acpi/battery/BAT0/info |grep -i 'design capacity:' |awk '{print $3}'",
+        total_bat = subprocess.Popen("grep 'last full capacity:' /proc/acpi/battery/BAT%s/info |awk '{print $4}' |grep [0-9] || echo 65130" % bat_id,
+            stdout=subprocess.PIPE, shell=True).communicate()[0].strip()
+        return 100 * float(current_bat) / float(total_bat)
+
+    def _fetch_net(self):
+        total_net = subprocess.Popen("ifstat -a -n -q -S -T 0.5 1 | tail -1 | awk '{ printf(\"↓%dkB/s ↑%dkB/s\", $6, $7) }'", stdout=subprocess.PIPE, shell=True).communicate()[0].strip()
+        return total_net
+
+    def _fetch_sensor(self, sensor_name):
+        sensor_data = sensor_name.split('//')
+
+        if (len(sensor_data) != 2):
+            return 'N/A'
+
+        sensor_item = sensor_data[1].replace('-', '.')
+        postfix = ''
+        if sensor_data[0] == 'hddtemp':
+            sensor_cmd = 'netcat localhost 7634'
+            netcat_value = subprocess.Popen(sensor_cmd, stdout=subprocess.PIPE, shell=True).communicate()[0].strip()
+            sensor_value = ''
+
+            for hd_data in self.parse_hddtemp_entries(netcat_value):
+                if hd_data[0] == sensor_item:
+                    sensor_value = hd_data[2] + '°' + hd_data[3]
+        else:
+            sensor_cmd = 'sensors -A ' + sensor_data[0] + " | grep -i '" + sensor_item + "' | cut -f 2 -d ':'  | awk '{print $1}'"
+            if sensor_data[0] == 'nvidia':
+                if sensor_item == 'gputemp':
+                    sensor_cmd = 'nvidia-settings -q [gpu:0]/GPUCoreTemp | grep "Attribute" | sed -e "s/.*: //g" -e "s/\.//g"'
+                    postfix = '°C'
+                elif sensor_item == 'fanspeed':
+                    sensor_cmd = 'nvidia-settings -q [fan:0]/GPUCurrentFanSpeed | grep "Attribute" | sed -e "s/.*: //g" -e "s/\.//g"'
+                    postfix = ' RPM'
+                else:
+                    sensor_cmd = None
+            elif sensor_data[0] == 'ati':
+                if sensor_item == 'gputemp':
+                    sensor_cmd = 'aticonfig --adapter=0 --od-gettemperature | grep "Sensor 0:" | awk ' + "'{ printf(\"%d\", $5) }'"
+                    postfix = '°C'
+
+            sensor_value = subprocess.Popen(sensor_cmd, stdout=subprocess.PIPE, shell=True).communicate()[0].strip()
+
+        if len(sensor_value):
+            sensor_value = self._clean_value(sensor_value) # Cleaning the + prefix
+            return sensor_value + postfix
+        else:
+            if sensor_cmd == None:
+                logging.info('Sensor not supported: ' + sensor_name)
+            else:
+                logging.info('Sensor command failed:\n' + sensor_cmd)
+            return 'N/A'
+
+    def _clean_value(self, value):
+        if value.find('+') == 0:
+            return value[1:]
+        return value
+
+    def _get_sensors_to_fetch(self):
+        fmt = string.Formatter()
+        tokens = []
+        for token in fmt.parse(self.parent.custom_text):
+            tokens.append(str(token[1]))
+
+        return tokens
+
+    def _fetch(self):
+        res = {}
+        for sensor in self._get_sensors_to_fetch():
+            if sensor == 'cpu':
+                res['cpu'] = '%02.0f%%' % self._fetch_cpu()
+            elif sensor == 'mem':
+                res['mem'] = '%02.0f%%' % self._fetch_mem()
+            elif sensor.startswith('bat'):
+                bat_id = sensor[3:]
+                try:
+                    bat_id = int(bat_id)
+                except:
+                    bat_id = 0
+                res[sensor] = '%02.0f%%' % self._fetch_bat(bat_id)
+            elif sensor == 'net':
+                res['net'] = self._fetch_net()
+            else:
+                res[sensor] = '%s' % self._fetch_sensor(sensor)
+
+        return res
+
+    def _fetch_user(self, command):
+        try:
+          output = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                    shell=True).communicate()[0].strip()
+          if output == '':
+              output = '(no output)'
+        except:
+          output = 'error'
+          logging.error('Error running: '+command)
+        return output
+
+    def parse_hddtemp_entries(self, netcat_value):
+        hddtemp_entries = []
+
+        if len(netcat_value):
+            for hd_row in netcat_value.strip('|').split('||'):
+                hddtemp_entries.append(hd_row.split('|'))
+
+        return hddtemp_entries
+
+    def run(self):
+        while(self.parent.alive.isSet()):
+            if self.parent.mode_user:
+                output = self._fetch_user(self.parent.user_command)
+                self.parent.update_text(output, output)
+            else:
+                data = self._fetch()
+                self.parent.update(data)
+            time.sleep(self.parent.interval)
+
+class SensorsListModel:
+    def __init__(self, parent):
+        self.ind_parent = parent
+        self.tree_store = gtk.TreeStore(gobject.TYPE_STRING, gobject.TYPE_STRING, gobject.TYPE_BOOLEAN)
+
+        # lib sensors
+        for sensor_data in subprocess.Popen('sensors', stdout=subprocess.PIPE, shell=True).communicate()[0].split('\n\n'):
+            sensor_name = None
+            skip_line = False
+            for line in sensor_data.split('\n'):
+                if len(line):
+                    if skip_line:
+                        skip_line = False
+                    else:
+                        if sensor_name == None:
+                            logging.info("New sensor found: " + line)
+                            sensor_name = line
+                            parent = self.tree_store.append(None, (sensor_name, None, False))
+                            skip_line = True
+                        else:
+                            logging.info("Sensor entry: " + line)
+                            self.tree_store.append(parent, (line, self.generate_sensor_item_name(sensor_name, line), False))
+
+        # hddtemp
+        hddtemp = subprocess.Popen('netcat localhost 7634', stdout=subprocess.PIPE, shell=True).communicate()[0].strip()
+        if len(hddtemp):
+            sensor_name = 'hddtemp'
+            logging.info("New sensor found: " + sensor_name)
+            parent = self.tree_store.append(None, (sensor_name, None, False))
+            for hd_data in self.ind_parent.ind_parent.fetch.parse_hddtemp_entries(hddtemp):
+                logging.info("Sensor entry: " + hd_data[0])
+                self.tree_store.append(parent, (hd_data[0] + ' - ' + hd_data[1] + ' - ' + hd_data[2] + '°' + hd_data[3], self.generate_sensor_item_name(sensor_name, hd_data[0]), False))
+
+        # nvidia GPU
+        nvidia_model = subprocess.Popen("lspci | grep nVidia | sed -e 's/.*\[//g' -e 's/\].*//g'", stdout=subprocess.PIPE, shell=True).communicate()[0].strip()
+        if len(nvidia_model):
+            sensor_name = 'nvidia'
+            logging.info("New sensor found: " + sensor_name)
+            parent = self.tree_store.append(None, (sensor_name, None, False))
+            self.tree_store.append(parent, (nvidia_model + ' - Temperature', self.generate_sensor_item_name(sensor_name, 'gputemp'), False))
+            self.tree_store.append(parent, (nvidia_model + ' - Fan speed', self.generate_sensor_item_name(sensor_name, 'fanspeed'), False))
+
+        # ati GPU
+        ati_model = subprocess.Popen('lspci | grep \"ATI Radeon HD"' + " | sed -e 's/.*\[//g' -e 's/\].*//g'", stdout=subprocess.PIPE, shell=True).communicate()[0].strip()
+        if len(ati_model):
+            sensor_name = 'ati'
+            logging.info("New sensor found: " + sensor_name)
+            parent = self.tree_store.append(None, (sensor_name, None, False))
+            self.tree_store.append(parent, (ati_model + ' - Temperature', self.generate_sensor_item_name(sensor_name, 'gputemp'), False))
+
+    def get_view(self):
+        self.view = gtk.HBox()
+
+        self.vb = gtk.VBox(False, 3)
+        l = gtk.Label('Sensors:')
+        l.set_alignment(0, 0.5)
+        self.vb.pack_start(l, expand=False, fill=False)
+
+        self.tree_view = gtk.TreeView(self.tree_store)
+
+        # setup the text cell renderer
+        self.renderer = gtk.CellRendererText()
+        self.renderer.set_property('editable', False)
+
+        # sensor name render
+        self.renderer1 = gtk.CellRendererText()
+        self.renderer1.set_property('editable', False)
+
+        # quick add checkbox render
+        self.renderer2 = gtk.CellRendererToggle()
+        self.renderer2.set_property('activatable', True)
+        self.renderer2.connect('toggled', self.quick_add_cb_toggled, self.tree_store)
+
+        # create columns
+        self.column0 = gtk.TreeViewColumn('Sensor', self.renderer, text=0)
+        self.column1 = gtk.TreeViewColumn('Identifier', self.renderer1, text=1)
+        self.column2 = gtk.TreeViewColumn('', self.renderer2, active=2)
+        self.tree_view.append_column(self.column0)
+        self.tree_view.append_column(self.column1)
+        self.tree_view.append_column(self.column2)
+
+        self.tree_view.expand_all()
+        sw = gtk.ScrolledWindow()
+        sw.add_with_viewport(self.tree_view)
+        self.vb.pack_start(sw, fill=True, expand=True)
+
+        self.add_bt = gtk.Button('Add selected sensors')
+        self.add_bt.connect('clicked', self.update_custom_text)
+        self.vb.pack_end(self.add_bt, fill=False, expand=False)
+
+        self.view.add(self.vb)
+        self.view.show()
+
+        return self.view
+
+    def quick_add_cb_toggled(self, cell, path, tree_store):
+        tree_store[path][2] = not tree_store[path][2]
+        iter = tree_store.iter_children(tree_store.get_iter(path))
+        while iter:
+            tree_store.set_value(iter, 2, tree_store[path][2])
+            iter = tree_store.iter_next(iter)
+
+    def generate_sensor_item_name(self, sensor_name, sensor_item_label):
+        return sensor_name + '//' + sensor_item_label.split(':')[0].lower().replace('.', '-')
+
+    def update_custom_text(self, event=None):
+        iter = self.tree_store.get_iter_root()
+
+        while iter:
+            iter_children = self.tree_store.iter_children(iter)
+            while iter_children:
+                if self.tree_store.get_value(iter_children, 2):
+                    current_text = self.ind_parent.custom_entry.get_text()
+                    to_add_value = '{' + self.tree_store.get_value(iter_children, 1) + '}'
+                    if string.find(current_text, to_add_value) == -1:
+                        self.ind_parent.custom_entry.set_text(current_text + ' ' + to_add_value)
+                iter_children = self.tree_store.iter_next(iter_children)
+
+            iter = self.tree_store.iter_next(iter)
+
+class Preferences(gtk.Window):
+    AUTOSTART_PATH = os.getenv("HOME") + '/.config/autostart/indicator-sysmonitor.desktop'
+    DESKTOP_PATH = '/usr/share/applications/indicator-sysmonitor.desktop'
+
+    def __init__(self, parent):
+        gtk.Window.__init__(self)
+        self.ind_parent = parent
+        self.connect('delete-event', self.on_destroy)
+
+        notebook = gtk.Notebook()
+        notebook.set_border_width(4)
+
+        vb = gtk.VBox(spacing=3)
+        hb = gtk.HBox()
+        hb.set_border_width(4)
+        l = gtk.Label('Run on startup:')
+        l.set_alignment(0, 0.5)
+        hb.pack_start(l)
+        self.autostart_check = gtk.CheckButton()
+        self.autostart_check.set_active(self.get_autostart())
+        hb.pack_end(self.autostart_check, expand=False, fill=False)
+        vb.pack_start(hb, expand=False, fill=False)
+
+        hb = gtk.HBox()
+        l = gtk.Label('This is indicator-sysmonitor version: %s' % VERSION)
+        l.set_alignment(0.5, 0.5)
+        hb.pack_start(l)
+        vb.pack_end(hb)
+        
+        notebook.append_page(vb, gtk.Label('General'))
+
+        vb = gtk.VBox(spacing=3)
+        hb = gtk.VBox()
+        self.custom_radio = gtk.RadioButton(label='Customize output:')
+        hb.pack_start(self.custom_radio)
+        self.custom_entry = gtk.Entry()
+        hb.pack_end(self.custom_entry)
+        vb.pack_start(hb, expand=False, fill=False)
+
+        hb = gtk.VBox()
+        self.user_radio = gtk.RadioButton(group=self.custom_radio, label='Use this command:')
+        hb.pack_start(self.user_radio)
+        self.user_entry = gtk.Entry(max=100)
+        #info = gtk.Label('Use this option to specify a program to be run every time the indicator refreshes')
+        #info.set_line_wrap(True)
+        #hb.pack_end(info)
+        hb.pack_end(self.user_entry)
+        vb.pack_start(hb, expand=False, fill=False)
+
+        hb = gtk.HBox()
+        l = gtk.Label('Update interval:')
+        l.set_alignment(0, 0.5)
+        hb.pack_start(l)
+        self.interval_entry = gtk.Entry(max=4)
+        self.interval_entry.set_width_chars(3)
+        hb.pack_end(self.interval_entry, expand=False, fill=False)
+        vb.pack_start(hb, expand=False, fill=False)
+
+        notebook.append_page(vb, gtk.Label('Advanced'))
+
+        if not parent.sensors_disabled:
+            sensors_list = SensorsListModel(self)
+            if sensors_list.tree_store.get_iter_root() != None:
+                vb.pack_start(sensors_list.get_view())
+
+        # footer
+        vb = gtk.VBox()
+        vb.pack_start(notebook)
+        buttons = gtk.HButtonBox()
+        buttons.set_layout(gtk.BUTTONBOX_EDGE)
+        test = gtk.Button('Test')
+        test.connect('clicked', self.update_parent)
+        buttons.pack_start(test)
+        cancel = gtk.Button(stock=gtk.STOCK_CANCEL)
+        cancel.connect('clicked', self.on_destroy)
+        buttons.pack_end(cancel)
+        close = gtk.Button(stock=gtk.STOCK_SAVE)
+        close.connect('clicked', self.on_save)
+        buttons.pack_end(close)
+        vb.pack_end(buttons, expand=False)
+
+        self.add(vb)
+        self.set_title('Preferences')
+        self.resize(400, 350)
+
+    def run(self):
+        self.set_position(gtk.WIN_POS_CENTER_ALWAYS)
+        self.show_all()
+        self.set_data()
+        gtk.main()
+
+    def on_destroy(self, event=None, data=None):
+        self.hide()
+        gtk.main_quit()
+        return False
+
+    def on_save(self, event=None, data=None):
+        self.update_parent()
+        self.ind_parent.save_settings()
+        self.update_autostart()
+        self.on_destroy()
+
+    def on_cancel(self, event=None, data=None):
+        self.ind_parent.load_settings()
+        self.on_destroy()
+
+    def set_data(self):
+        self.custom_entry.set_text(self.ind_parent.custom_text)
+        self.user_entry.set_text(self.ind_parent.user_command)
+        self.interval_entry.set_text(str(self.ind_parent.interval))
+        if self.ind_parent.mode_user:
+            self.user_radio.set_active(True)
+        else:
+            self.custom_radio.set_active(True)
+
+    def update_parent(self, event=None):
+        custom_text = self.custom_entry.get_text()
+        user_text = self.user_entry.get_text()
+        try: interval = int(self.interval_entry.get_text()); assert interval > 0
+        except: interval = self.ind_parent.interval
+        mode_user = [r for r in self.custom_radio.get_group() if r.get_active()][0]
+        self.ind_parent.custom_text = custom_text
+        self.ind_parent.user_command = user_text
+        self.ind_parent.mode_user = (mode_user == self.user_radio)
+        self.ind_parent.interval = interval
+        self.ind_parent.force_update()
+
+    def update_autostart(self):
+        autostart = self.autostart_check.get_active()
+        if not autostart:
+            try:
+                os.remove(Preferences.AUTOSTART_PATH)
+            except: pass
+        else:
+            try:
+                shutil.copy(Preferences.DESKTOP_PATH, Preferences.AUTOSTART_PATH)
+            except Exception as e:
+                logging.exception(e)
+
+    def get_autostart(self):
+        return os.path.exists(Preferences.AUTOSTART_PATH)
+
+class IndicatorSysmonitor:
+    SETTINGS_FILE = os.getenv("HOME") + '/.indicator-sysmonitor.json'
+    SENSORS_DISABLED = False
+
+    def __init__(self):
+        self.preferences_dialog = None
+        self.custom_text = 'cpu: {cpu} mem: {mem}'
+        self.user_command = ''
+        self.last_data, self.last_text, self.last_guide = {}, '', ''
+        self.mode_user = False
+        self.sensors_disabled = IndicatorSysmonitor.SENSORS_DISABLED
+        self.interval = 2
+
+        self.ind = appindicator.Indicator ("indicator-sysmonitor",
+          "sysmonitor",
+            appindicator.CATEGORY_SYSTEM_SERVICES)
+        self.ind.set_status (appindicator.STATUS_ACTIVE)
+        self.ind.set_label("Init...")
+        self.menu = gtk.Menu()
+       
+        full_sysmon = gtk.MenuItem('System Monitor')
+        full_sysmon.connect('activate', self.on_full_sysmon_activated)
+        self.menu.add(full_sysmon)
+
+        self.menu.add(gtk.SeparatorMenuItem())
+
+        pref_menu = gtk.MenuItem('Preferences')
+        pref_menu.connect('activate', self.on_preferences_activated)
+        self.menu.add(pref_menu)
+
+        exit_menu = gtk.ImageMenuItem(stock_id=gtk.STOCK_QUIT)
+        exit_menu.connect('activate', self.on_exit)
+        self.menu.add(exit_menu)
+       
+        self.menu.show_all()
+
+        self.ind.set_menu(self.menu)
+
+        logging.info("Menu shown")
+
+        self.load_settings()
+
+        self.alive = Event()
+        self.alive.set()
+        self.fetch = StatusFetcher(self)
+        self.fetch.start()
+        logging.info("Fetcher started")
+
+    def update(self, data):
+        try:
+            label = self.custom_text.format(**data)
+            cdata = deepcopy(data)
+            cdata['mem'] = cdata['cpu'] = cdata['bat'] = '000%'
+            cdata['net'] = ''
+            guide = self.custom_text.format(**cdata)
+        except KeyError as e:
+            logging.exception(e)
+            logging.info('not found in dataset')
+            return
+        except:
+            label = 'Unknown error'
+        if not label:
+            label = '(no output)'
+        self.last_data = data
+        self.last_guide = guide
+        self.update_text(label, guide)
+
+    def update_text(self, text, guide):
+        self.last_text = text
+        self.last_guide = guide
+        self.ind.set_label(text, guide)
+
+    def force_update(self):
+        if self.mode_user:
+            self.update_text(self.last_text, self.last_guide)
+        else:
+            self.update(self.last_data)
+
+    def on_exit(self, event=None):
+        logging.info("Terminated")
+        self.alive.clear()
+        try: gtk.main_quit()
+        except RuntimeError: pass
+
+    def load_settings(self):
+        try:
+            with open(IndicatorSysmonitor.SETTINGS_FILE, 'r') as f:
+              settings = json.load(f)
+            self.mode_user = settings['mode_user']
+            self.custom_text = settings['custom_text']
+            self.user_command = settings['user_command']
+            self.interval = settings['interval']
+            self.sensors_disabled = settings.get('sensors_disabled', IndicatorSysmonitor.SENSORS_DISABLED)
+        except Exception as e:
+            logging.exception(e)
+            logging.error('Reading settings failed')
+
+    def save_settings(self):
+        # TODO: use gsettings
+        settings = {'mode_user': self.mode_user,
+                  'custom_text': self.custom_text,
+                  'user_command': self.user_command,
+                  'interval': self.interval,
+                  'sensors_disabled': self.sensors_disabled}
+        try:
+          with open(IndicatorSysmonitor.SETTINGS_FILE, 'w') as f:
+              f.write(json.dumps(settings))
+        except Exception as e:
+            logging.exception(e)
+            logging.error('Writting settings failed')
+
+    def on_preferences_activated(self, event=None):
+        self.preferences_dialog = Preferences(self)
+        self.preferences_dialog.run()
+
+    def on_full_sysmon_activated(self, event=None):
+        os.system('gnome-system-monitor &')
+
+from optparse import OptionParser
+
+if __name__ == "__main__":
+    parser = OptionParser("usage: %prog [options]", version="%prog "+VERSION)
+    parser.add_option("--config", "", default=None,
+                      help="use custom config file")
+    parser.add_option("--disable-sensors",  action="store_true",
+                      help="disable sensors", default=False)
+    parser.add_option("--enable-sensors",  action="store_true",
+                      help="re-enable sensors", default=False)
+
+    (options, args) = parser.parse_args()
+
+    if options.config:
+        if not os.path.exists(options.config):
+            print options.config, "does not exist!"
+            sys.exit(-1)
+        IndicatorSysmonitor.SETTINGS_FILE = options.config
+
+    # setup an instance with config
+    i = IndicatorSysmonitor()
+    if options.disable_sensors:
+        i.sensors_disabled = True
+        i.save_settings()
+        logging.info("Sensors disabled")
+
+    if options.enable_sensors:
+        i.sensors_disabled = False
+        i.save_settings()
+        logging.info("Sensors enabled")
+
+    try:
+        gtk.main()
+    except KeyboardInterrupt:
+        i.on_exit()
