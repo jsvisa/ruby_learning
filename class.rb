@@ -1,5 +1,6 @@
 class Person
 	@@number = 0
+	#@@number 
 	def self.getNumber
 		@@number
 	end

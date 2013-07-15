@@ -7,6 +7,7 @@
 # Homepage: http://launchpad.net/indicator-sysmonitor
 # License: GPL v3
 #
+
 import sys
 import os
 import shutil
@@ -596,3 +597,4 @@ if __name__ == "__main__":
         gtk.main()
     except KeyboardInterrupt:
         i.on_exit()
+

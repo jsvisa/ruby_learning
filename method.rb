@@ -1,6 +1,6 @@
 public
 
-#meth is a private method of Object
+# meth is a private method of Object
 # while we use public to change it's proprity
 def meth
 	puts self.class

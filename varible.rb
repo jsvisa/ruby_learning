@@ -33,3 +33,6 @@ Season = case month
 		 end
 
 puts Season
+
+puts $:
+
