@@ -32,10 +32,15 @@ meth1
 
 class MyException < RuntimeError
 end
+class MyException1 < RuntimeError
+end
 
 begin
 	raise MyException, "MyException Error"
-rescue MyException => ex
+#rescue MyException => ex
+#	puts ex.to_s #puts ex's description
+#	puts ex.backtrace.join("\n")
+rescue MyException1 => ex
 	puts ex.to_s #puts ex's description
 	puts ex.backtrace.join("\n")
 ensure

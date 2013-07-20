@@ -14,6 +14,7 @@ class Person
 		puts "hangzhou"
 	end
 end
+puts Person.ancestors
  
 Person.address  #class methoe
  
