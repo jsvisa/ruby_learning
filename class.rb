@@ -1,6 +1,5 @@
 class Person
 	@@number = 0
-	#@@number 
 	def self.getNumber
 		@@number
 	end
@@ -8,17 +7,22 @@ end
 
 puts Person.getNumber
  
-#class method
+# class method
 class Person
 	def self.address
-		puts "hangzhou"
+		"hangzhou"
 	end
 end
-puts Person.ancestors
+
+def Person.access
+  puts "Person.access"
+end
+
+puts "Person's ancestors are #{Person.ancestors}"
+puts "Class method:#{Person.address}"
+Person.access
  
-Person.address  #class methoe
- 
-#eigenclass
+# eigenclass
 class Person
 	class << self
 		def name
@@ -31,7 +35,7 @@ Person.name
  
 #===============================#
  
-#another herpderp eigenclass demo
+# another herpderp eigenclass demo
  
 li = Person.new
 zh = Person.new
@@ -47,7 +51,7 @@ zh.kick_li
  
 #===============================#
  
-#class method
+# class method
 Person.instance_eval do
 	def age
 		puts "22"
@@ -56,7 +60,7 @@ end
  
 Person.age
  
-#instance method
+# instance method
 Person.class_eval do
 	def sex
 		puts "male"
@@ -65,14 +69,14 @@ end
  
 Person.new.sex
  
-#Class method
+# Class method
 def Person.nick
 	puts "s"
 end
  
 Person.nick
  
-#open Person Class
+# Open Person Class
 class << Person
 	def species
 		puts "chinese"
@@ -81,7 +85,7 @@ end
  
 Person.species
  
-#le herpderp Class method (MAP
+# le herpderp Class method (MAP
 class Class
 	def loud_name
 		puts "Saito"
