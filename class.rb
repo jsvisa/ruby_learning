@@ -51,7 +51,7 @@ zh.kick_li
  
 #===============================#
  
-# class method
+# open as an instance, the object acts as a class
 Person.instance_eval do
 	def age
 		puts "22"
@@ -60,7 +60,7 @@ end
  
 Person.age
  
-# instance method
+# open as a class, the object acts as an instance
 Person.class_eval do
 	def sex
 		puts "male"
